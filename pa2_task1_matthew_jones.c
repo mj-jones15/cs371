@@ -38,10 +38,16 @@ void *client_thread_func(void *arg) {
 
     socklen_t addr_len = sizeof(data->server_addr);
 
+    // Set a 100 ms receive timeout
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000; // 100 ms
+    setsockopt(data->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
     int outstanding = 0;
     long sent = 0;
 
-    while (data->rx_cnt < num_requests) {
+    while (1) {
 
         while (outstanding < PIPELINE && sent < num_requests) {
 
@@ -58,7 +64,18 @@ void *client_thread_func(void *arg) {
 
         if (n > 0) {
             data->rx_cnt++;
-            outstanding--;
+            if (outstanding > 0) {
+                outstanding--;
+            }
+        } else {
+            // Timeout occurred
+            if (sent >= num_requests && outstanding == 0) {
+                break;
+            }
+            if (sent >= num_requests) {
+                // Assume remaining packets were lost
+                break;
+            }
         }
     }
 
