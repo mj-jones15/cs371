@@ -16,8 +16,9 @@
 # SPDX-License-Identifier: Apache-2.0
 */
 
-/*
+/* 
 Please specify the group members here
+
 # Student #1: Matthew Jones
 */
 
@@ -40,89 +41,65 @@ int server_port = 12345;
 int num_client_threads = DEFAULT_CLIENT_THREADS;
 int num_requests = 1000000;
 
-/*
- * This structure is used to store per-thread data in the client
- */
 typedef struct {
-    int epoll_fd;        /* File descriptor for the epoll instance, used for monitoring events on the socket. */
-    int socket_fd;       /* File descriptor for the client socket connected to the server. */
-    long long total_rtt; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
-    long total_messages; /* Total number of messages sent and received. */
-    float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages. */
+    int epoll_fd;
+    int socket_fd;
+    long long total_rtt;
+    long total_messages;
+    float request_rate;
 } client_thread_data_t;
 
-/*
- * This function runs in a separate client thread to handle communication with the server
- */
 void *client_thread_func(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
     struct epoll_event event, events[MAX_EVENTS];
     char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP";
     char recv_buf[MESSAGE_SIZE];
     struct timeval start, end;
-    long long elapsed_us = 0;
 
-    memset(&event, 0, sizeof(event));
-    event.events = EPOLLIN;
-    event.data.fd = data->socket_fd;
-    if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event) < 0) {
-        perror("epoll_ctl (client)");
-        pthread_exit(NULL);
-    }
-
+    data->request_rate = 0;
     data->total_rtt = 0;
     data->total_messages = 0;
 
-    for (int i = 0; i < num_requests; i++) {
+    // Register the socket in the epoll instance
+    event.events = EPOLLIN;
+    event.data.fd = data->socket_fd;
+    epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event);
+
+    while (1) {
+        // Send a message
         gettimeofday(&start, NULL);
+        send(data->socket_fd, send_buf, MESSAGE_SIZE, 0);
 
-        ssize_t sent = send(data->socket_fd, send_buf, MESSAGE_SIZE, 0);
-        if (sent <= 0) {
-            perror("send");
-            break;
-        }
-
-        int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, -1);
-        if (nfds < 0) {
-            perror("epoll_wait (client)");
-            break;
-        }
-
-        for (int j = 0; j < nfds; j++) {
-            if (events[j].data.fd == data->socket_fd) {
-                ssize_t recvd = recv(data->socket_fd, recv_buf, MESSAGE_SIZE, 0);
-                if (recvd <= 0) {
-                    perror("recv");
-                    goto done;
-                }
-
+        // Wait for the response
+        int n_events = epoll_wait(data->epoll_fd, events, MAX_EVENTS, -1);
+        for (int i = 0; i < n_events; i++) {
+            if (events[i].data.fd == data->socket_fd) {
+                recv(data->socket_fd, recv_buf, MESSAGE_SIZE, 0);
                 gettimeofday(&end, NULL);
-                elapsed_us = (end.tv_sec - start.tv_sec) * 1000000LL +
-                             (end.tv_usec - start.tv_usec);
-                data->total_rtt += elapsed_us;
+
+                // Calculate RTT
+                long long rtt = (end.tv_sec - start.tv_sec) * 1000000LL + (end.tv_usec - start.tv_usec);
+                data->total_rtt += rtt;
                 data->total_messages++;
             }
         }
+
+        // Break after a fixed number of messages
+        if (data->total_messages >= num_requests) break; // Example condition
     }
 
-done:
-    if (data->total_messages > 0) {
-        double total_seconds = (double)data->total_rtt / 1000000.0;
-        data->request_rate = data->total_messages / total_seconds;
-    } else {
-        data->request_rate = 0.0;
-    }
+    // Update request rate
+    data->request_rate = (float) data->total_messages * 1000000 / (float) data->total_rtt;
+
+    // printf("Total RTT: %lld s\n", data->total_rtt / 1000000);
+    // printf("Total messages: %ld\n", data->total_messages);
+    // printf("RPS: %f\n", data->request_rate);
 
     close(data->socket_fd);
     close(data->epoll_fd);
-
     return NULL;
 }
 
-/*
- * This function orchestrates multiple client threads to send requests to a server,
- * collect performance data of each threads, and compute aggregated metrics of all threads.
- */
 void run_client() {
     pthread_t threads[num_client_threads];
     client_thread_data_t thread_data[num_client_threads];
@@ -133,38 +110,21 @@ void run_client() {
     server_addr.sin_port = htons(server_port);
     inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
 
+    // Create client threads
     for (int i = 0; i < num_client_threads; i++) {
-        int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        if (sockfd < 0) {
-            perror("socket");
-            exit(1);
-        }
+        thread_data[i].epoll_fd = epoll_create1(0);
+        thread_data[i].socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+        connect(thread_data[i].socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    }
 
-        if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-            perror("connect");
-            close(sockfd);
-            exit(1);
-        }
-
-        int epfd = epoll_create1(0);
-        if (epfd < 0) {
-            perror("epoll_create1");
-            close(sockfd);
-            exit(1);
-        }
-
-        thread_data[i].socket_fd = sockfd;
-        thread_data[i].epoll_fd = epfd;
-        thread_data[i].total_rtt = 0;
-        thread_data[i].total_messages = 0;
-        thread_data[i].request_rate = 0.0;
-
+    for (int i = 0; i < num_client_threads; i++) {
         pthread_create(&threads[i], NULL, client_thread_func, &thread_data[i]);
     }
 
+    // Wait for threads to complete
     long long total_rtt = 0;
     long total_messages = 0;
-    float total_request_rate = 0.0;
+    float total_request_rate = 0;
 
     for (int i = 0; i < num_client_threads; i++) {
         pthread_join(threads[i], NULL);
@@ -173,107 +133,57 @@ void run_client() {
         total_request_rate += thread_data[i].request_rate;
     }
 
-    if (total_messages > 0) {
-        printf("Average RTT: %lld us\n", total_rtt / total_messages);
-    } else {
-        printf("Average RTT: 0 us\n");
-    }
+    printf("Average RTT: %lld us\n", total_rtt / total_messages);
     printf("Total Request Rate: %f messages/s\n", total_request_rate);
 }
 
 void run_server() {
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        perror("socket");
-        exit(1);
-    }
-
-    int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in server_addr;
+
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(server_port);
-    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
 
-    if (bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind");
-        close(listen_fd);
-        exit(1);
-    }
+    bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    listen(server_fd, 128);
 
-    if (listen(listen_fd, SOMAXCONN) < 0) {
-        perror("listen");
-        close(listen_fd);
-        exit(1);
-    }
-
-    int epfd = epoll_create1(0);
-    if (epfd < 0) {
-        perror("epoll_create1");
-        close(listen_fd);
-        exit(1);
-    }
-
+    int epoll_fd = epoll_create1(0);
     struct epoll_event event, events[MAX_EVENTS];
-    memset(&event, 0, sizeof(event));
+
     event.events = EPOLLIN;
-    event.data.fd = listen_fd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &event) < 0) {
-        perror("epoll_ctl (listen_fd)");
-        close(listen_fd);
-        close(epfd);
-        exit(1);
-    }
+    event.data.fd = server_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event);
 
     while (1) {
-        int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
-        if (nfds < 0) {
-            perror("epoll_wait (server)");
-            break;
-        }
+        int n_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        for (int i = 0; i < n_events; i++) {
+            if (events[i].data.fd == server_fd) {
+                // Accept a new connection
+                int client_fd = accept(server_fd, NULL, NULL);
 
-        for (int i = 0; i < nfds; i++) {
-            int fd = events[i].data.fd;
-
-            if (fd == listen_fd) {
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-                int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
-                if (client_fd < 0) {
-                    perror("accept");
-                    continue;
-                }
-
-                struct epoll_event client_event;
-                memset(&client_event, 0, sizeof(client_event));
-                client_event.events = EPOLLIN;
-                client_event.data.fd = client_fd;
-                if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &client_event) < 0) {
-                    perror("epoll_ctl (client_fd)");
-                    close(client_fd);
-                }
+                event.events = EPOLLIN;
+                event.data.fd = client_fd;
+                epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event);
             } else {
-                char buf[MESSAGE_SIZE];
-                ssize_t n = recv(fd, buf, MESSAGE_SIZE, 0);
+                // Handle client data
+                char buffer[MESSAGE_SIZE];
+                int client_fd = events[i].data.fd;
+
+                int n = recv(client_fd, buffer, MESSAGE_SIZE, 0);
                 if (n <= 0) {
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                    close(fd);
+                    close(client_fd);
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, NULL);
                 } else {
-                    ssize_t sent = send(fd, buf, n, 0);
-                    if (sent <= 0) {
-                        perror("send (server)");
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                        close(fd);
-                    }
+                    send(client_fd, buffer, MESSAGE_SIZE, 0);
                 }
             }
         }
     }
 
-    close(listen_fd);
-    close(epfd);
+    close(server_fd);
+    close(epoll_fd);
 }
 
 int main(int argc, char *argv[]) {
